@@ -13,9 +13,9 @@ def main():
     try:
         bar('0')
     except StandardError as e:
-        print 'Error!'
-        # logging.exception(e)
-        raise ValueError('input error!')
+        # print 'Error!'
+        logging.exception(e)
+        # raise ValueError('input error!')
 
 
 main()

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
 class Student(object):
 
-    def __init__(self, name, score):
+    def __init__(self, name, score, age):
         self.__name = name
         self.__score = score
+        self._age = age
 
     def get_name(self):
         return self.__name
@@ -27,7 +29,9 @@ class Student(object):
         else:
             return 'C'
 
-bart = Student('Bart Simpson', 59)
+
+bart = Student('Bart Simpson', 59, 10)
+print ('bart._age =', bart._age)
 print('bart.get_name() =', bart.get_name())
 bart.set_score(60)
 print('bart.get_score() =', bart.get_score())
