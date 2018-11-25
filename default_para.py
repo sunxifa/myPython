@@ -1,4 +1,4 @@
-#default parameter
+# default parameter
 def power(x, n=2):
     s = 1
     while n > 0:
