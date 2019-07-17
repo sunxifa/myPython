@@ -1,0 +1,232 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
+import prettytable as pt
+import sys
+import subprocess
+from keystoneauth1.identity import v3
+from keystoneauth1 import session
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tenant-id')
+parser.add_argument('--id')
+parser.add_argument('--name')
+parser.add_argument('--shared', choices=('True', 'False'))
+parser.add_argument('--sort-key', choices=('id', 'name', 'tenant_id'))
+parser.add_argument('--sort-dir', choices=('asc', 'desc'))
+parser.add_argument('--limit')
+
+# Config Opts
+galera_conf = '/etc/kolla/mariadb/galera.cnf'
+ADMIN_STATE_UP = {
+    'True': '1',
+    'False': '0'
+}
+
+SHARED_MAP = {
+    'True': 'is not null',
+    'False': 'is null'
+}
+
+sort_keys_convert = {
+    'id': 'SUB.id',
+    'name': 'SUB.name',
+    'tenant_id': 'SUB.project_id',
+}
+
+sqlines = ''' SELECT SUB.id, SUB.name, SUB.project_id AS tenant_id, SUB.cidr,
+              GROUP_CONCAT(CONCAT(IPA.first_ip, ' ', IPA.last_ip)) AS allocation_pools 
+              FROM(SELECT S.id,
+                         S.name,
+                         S.project_id,
+                         S.cidr,
+                         RBA.action AS shared
+                    FROM neutron.subnets AS S
+                    LEFT JOIN 
+                    (SELECT R.object_id,
+                             R.action
+                      FROM neutron.networkrbacs AS R
+                      WHERE R.action = 'access_as_shared')
+                    AS RBA ON S.network_id = RBA.object_id) AS SUB
+              LEFT JOIN neutron.ipallocationpools AS IPA ON SUB.id = IPA.subnet_id
+              %(filter)s
+              GROUP BY SUB.id
+              %(order_by)s %(limit)s ;
+'''
+
+sql_temp = ''' docker exec -it \
+                           -u root mariadb \
+                           mysql -u%(user)s -p%(passwd)s -e "%(sqline)s"
+'''
+
+
+def _get_where_clause(conf, project_id, is_admin=True):
+    clause = ""
+    if conf.id:
+        clause = "%s AND SUB.id = '%s' " % (clause, conf.id)
+    if conf.tenant_id:
+        clause = "%s AND SUB.project_id = '%s' " % (clause, conf.tenant_id)
+    if conf.name:
+        clause = "%s AND SUB.name = '%s' " % (clause, conf.name)
+    if conf.shared:
+        clause = "%s AND SUB.shared %s " % (clause, SHARED_MAP[conf.shared])
+    if not is_admin:
+        if conf.tenant_id:
+            if conf.tenant_id != project_id:
+                clause = "%s AND (SUB.shared %s AND SUB.project_id = '%s') " % (
+                    clause, SHARED_MAP['True'], conf.tenant_id)
+            elif conf.tenant_id == project_id:
+                clause = "%s AND SUB.project_id = '%s' " % (clause, conf.tenant_id)
+        else:
+            clause = "%s AND (SUB.shared %s OR SUB.project_id = '%s') " % (clause, SHARED_MAP['True'], project_id)
+    elif conf.tenant_id:
+        clause = "%s AND SUB.project_id = '%s' " % (clause, conf.tenant_id)
+
+    if clause != "":
+        clause = "WHERE 1=1 %s " % clause
+
+    return clause
+
+
+def _get_orderby_clause(conf):
+    clause = ""
+    if conf.sort_key:
+        clause = "ORDER BY %s %s" % (sort_keys_convert[conf.sort_key], "asc")
+        if conf.sort_dir:
+            clause = "ORDER BY %s %s" % (sort_keys_convert[conf.sort_key], conf.sort_dir)
+    elif conf.sort_dir:
+        clause = "ORDER BY %s %s" % (sort_keys_convert['id'], conf.sort_dir)
+    return clause
+
+
+def _get_limit_clause(conf):
+    clause = ""
+    if conf.limit:
+        clause = "LIMIT 0,%s" % conf.limit
+    return clause
+
+
+def _parse_galera():
+    with open(galera_conf, 'r+') as reader:
+        configs = reader.read()
+        for line in configs.split('\n'):
+            if line.startswith('wsrep_sst_auth'):
+                user_pass = line.rsplit()[-1]
+                return user_pass.split(':')
+
+
+def _exec(cmdline):
+    fd = subprocess.Popen(cmdline, shell=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    return fd.stdout.read(), fd.stderr.read()
+
+
+def _warn_and_exit(msg):
+    print "error: %s" % msg
+    sys.exit()
+
+
+def _authenticate_roles():
+    os_auth_url = os.getenv('OS_AUTH_URL')
+    if not os_auth_url:
+        _warn_and_exit('Necessary auth environments not found')
+    if os_auth_url.split('/')[-1] != 'v3':
+        os_auth_url = os.path.join(os_auth_url, 'v3')
+    auth_map = {
+        'username': os.getenv('OS_USERNAME'),
+        'password': os.getenv('OS_PASSWORD'),
+        'project_name': os.getenv('OS_PROJECT_NAME'),
+        'user_domain_name': os.getenv('OS_USER_DOMAIN_NAME'),
+        'project_domain_name': os.getenv('OS_PROJECT_DOMAIN_NAME'),
+        'auth_url': os_auth_url
+    }
+    keystone_auth = v3.Password(**auth_map)
+    keystone_session = session.Session(
+        auth=keystone_auth,
+        verify=False
+    )
+    accessinfo = keystone_auth.get_auth_ref(keystone_session)
+    return accessinfo.project_id, accessinfo.role_names
+
+
+def _is_admin(role_names):
+    role_name = set(role_names)
+    if 'admin' in role_name:
+        return True
+    return False
+
+
+def _check_requirements():
+    def _check_galera_conf():
+        return os.path.exists(galera_conf)
+
+    if not _check_galera_conf():
+        MSG = "Galera conf file not found."
+        _warn_and_exit(MSG)
+
+    def _check_mariadb():
+        check_mariadb = 'docker ps -a | grep mariadb'
+        result = _exec(check_mariadb)[0]
+        return result and 'Exit' not in result
+
+    if not _check_mariadb():
+        MSG = "Mariadb service not running."
+        _warn_and_exit(MSG)
+
+
+def _to_table(data):
+    lines = data.split('\n')[3:-2]
+    result = []
+    for r in lines:
+        id, name, project, cidr, allocation_pool = r.split('|')[1:-1]
+        if id:
+            pools_d = {}
+            pools_l = []
+            for pool in allocation_pool.split(','):
+                start, end = pool.strip().split(' ')
+                pools_d['start'] = start
+                pools_d['end'] = end
+                pools_str = str(pools_d)
+                if len(pools_str) > 55:
+                    pools_str = pools_str.replace(',', ',\n')
+                pools_l.append(pools_str)
+            allocation_pools = '\n'.join(pools_l)
+            result.append([
+                id.strip(), name.strip(), project.strip(),
+                cidr.strip(), allocation_pools.strip()
+            ])
+    table = pt.PrettyTable()
+    table.field_names = ['id', 'name', 'tenant_id', 'cidr', 'allocation_pools']
+    table.align = 'l'
+    for i, n, pj, cr, al in result:
+        table.add_row([i, n, pj, cr, al])
+    print table
+
+
+if __name__ == '__main__':
+    auth_project_id, auth_role_names = _authenticate_roles()
+    args = parser.parse_args()
+    _check_requirements()
+    user, passwd = _parse_galera()
+
+    filter = _get_where_clause(args, auth_project_id, _is_admin(auth_role_names))
+    order_by = _get_orderby_clause(args)
+    limit = _get_limit_clause(args)
+
+    # print filter,order_by,limit
+    sqlines = sqlines % {
+        'filter': filter,
+        'order_by': order_by,
+        'limit': limit
+    }
+    domains = sql_temp % {
+        'user': user,
+        'passwd': passwd,
+        'sqline': sqlines
+    }
+    # print domains
+    data = _exec(domains)[0]
+    _to_table(data)
